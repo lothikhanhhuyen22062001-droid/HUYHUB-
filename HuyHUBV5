@@ -1,0 +1,511 @@
+--[[═══════════════════════════════════════════════════════════════════════
+    ██╗  ██╗██╗   ██╗██╗   ██╗██╗  ██╗██╗   ██╗██████╗ 
+    ██║  ██║██║   ██║╚██╗ ██╔╝██║  ██║██║   ██║██╔══██╗
+    ███████║██║   ██║ ╚████╔╝ ███████║██║   ██║██████╔╝
+    ██╔══██║██║   ██║  ╚██╔╝  ██╔══██║██║   ██║██╔══██╗
+    ██║  ██║╚██████╔╝   ██║   ██║  ██║╚██████╔╝██████╔╝
+    ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝
+                K E Y   S Y S T E M   v5.0
+    ═══════════════════════════════════════════════════════════════════
+    Framework-grade single-file build
+      · Reactive Store (Redux-like)
+      · Encrypted local persistence (XOR + Base64)
+      · HWID binding + optional server verify
+      · Token bucket rate limit + exponential lockout
+      · FNV-1a hash + constant-time compare
+      · Circuit-breaker HTTP + retry backoff
+      · Spring physics motion engine
+      · Toast queue, loader overlay, keyboard nav
+      · i18n (vi/en), telemetry opt-in, plugin system
+    ═══════════════════════════════════════════════════════════════════]]
+
+--=============================================================
+-- [0] SERVICES
+--=============================================================
+local CoreGui = game:GetService("CoreGui")
+local UIS     = game:GetService("UserInputService")
+local Tween   = game:GetService("TweenService")
+local RS      = game:GetService("RunService")
+local Http    = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local LP      = Players.LocalPlayer or { UserId = 0, Name = "Unknown", AccountAge = 0 }
+
+--=============================================================
+-- [1] CONFIG  (chỉnh tại đây — không cần sửa sâu bên dưới)
+--=============================================================
+local CONFIG = {
+    UI_NAME      = "HuyHubKeySystem_v5",
+    CORRECT_KEY  = "Huy-77955B09F65G8551",       -- fallback offline key
+    LINK_4M      = "https://link4m.net/P2fD4r",
+    SCRIPT_URL   = "https://raw.githubusercontent.com/lothikhanhhuyen22062001-droid/Huydeptrai/refs/heads/main/Scripthuy",
+    AUTH_ENDPOINT = "",                           -- "" = offline mode. VD: "https://api.huyhub.dev"
+    AUTH_PATH     = "/api/v5/verify",
+    SALT          = "\0HuyHub::v5::2025\0",
+    SCRIPT_HASH   = nil,                          -- nếu set: verify FNV hash của script
+    DEFAULT_LANG  = "vi",
+}
+
+--=============================================================
+-- [2] KERNEL · tiny utils
+--=============================================================
+local K = {}
+function K.clone(t) local r={} for k,v in pairs(t) do r[k]=v end return r end
+function K.merge(...) local o={} for _,t in ipairs({...}) do for k,v in pairs(t) do o[k]=v end end return o end
+function K.retry(fn, attempts, base)
+    attempts, base = attempts or 3, base or 0.4
+    return function(...)
+        local a = {...}
+        for i = 1, attempts do
+            local ok, r = pcall(fn, table.unpack(a))
+            if ok then return true, r end
+            if i < attempts then task.wait(base * (2^(i-1))) end
+        end
+        return false, "max_retries"
+    end
+end
+
+--=============================================================
+-- [3] CRYPTO · XOR+Base64 + FNV-1a
+--=============================================================
+local Crypto = {}
+do
+    local KEY = {0x48,0x75,0x79,0x48,0x75,0x62,0x35,0x30}
+    local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    local function xorBytes(str)
+        local out = {}
+        for i = 1, #str do
+            out[i] = string.char(bit32.bxor(string.byte(str, i), KEY[((i-1) % #KEY) + 1]))
+        end
+        return table.concat(out)
+    end
+
+    local function b64Encode(data)
+        return ((data:gsub('.', function(x)
+            local r, b = '', x:byte()
+            for i = 8,1,-1 do r = r .. (b % 2^i - b % 2^(i-1) > 0 and '1' or '0') end
+            return r
+        end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+            if #x < 6 then return '' end
+            local c = 0
+            for i = 1, 6 do c = c + (x:sub(i,i) == '1' and 2^(6-i) or 0) end
+            return B64:sub(c+1, c+1)
+        end)..({ '', '==', '=' })[#data % 3 + 1])
+    end
+
+    local function b64Decode(data)
+        data = data:gsub('[^'..B64..'=]', '')
+        return (data:gsub('.', function(x)
+            if x == '=' then return '' end
+            local r, f = '', (B64:find(x) - 1)
+            for i = 6,1,-1 do r = r .. (f % 2^i - f % 2^(i-1) > 0 and '1' or '0') end
+            return r
+        end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+            if #x ~= 8 then return '' end
+            local c = 0
+            for i = 1, 8 do c = c + (x:sub(i,i) == '1' and 2^(8-i) or 0) end
+            return string.char(c)
+        end))
+    end
+
+    function Crypto.encrypt(s) return b64Encode(xorBytes(s)) end
+    function Crypto.decrypt(s) return xorBytes(b64Decode(s)) end
+
+    function Crypto.fnv1a(str)
+        local h = 2166136261
+        for i = 1, #str do
+            h = bit32.bxor(h, string.byte(str, i))
+            h = (h * 16777619) % 4294967296
+        end
+        return h
+    end
+
+    function Crypto.ctEq(a, b)
+        if type(a) ~= "number" or type(b) ~= "number" then return false end
+        local d = 0
+        for i = 0, 31 do
+            d = bit32.bor(d, bit32.band(bit32.rshift(a, i), 1) ~= bit32.band(bit32.rshift(b, i), 1) and 1 or 0)
+        end
+        return d == 0
+    end
+end
+
+--=============================================================
+-- [4] PERSIST · encrypted local KV cache
+--=============================================================
+local Persist = {}
+do
+    local FILE = "huyhub_v5.cache"
+    local cache = nil
+
+    local function load()
+        if cache then return cache end
+        cache = {}
+        local ok, raw = pcall(readfile, FILE)
+        if ok and raw and #raw > 0 then
+            local dok, dec = pcall(Crypto.decrypt, raw)
+            if dok then
+                local pok, tbl = pcall(function() return loadstring("return "..dec)() end)
+                if pok and type(tbl) == "table" then cache = tbl end
+            end
+        end
+        return cache
+    end
+
+    local function flush()
+        if not cache then return end
+        local p = {}
+        for k, v in pairs(cache) do
+            if type(v) == "string" then p[#p+1] = string.format("[%q]=%q", k, v)
+            elseif type(v) == "number" or type(v) == "boolean" then p[#p+1] = string.format("[%q]=%s", k, tostring(v)) end
+        end
+        pcall(writefile, FILE, Crypto.encrypt("{"..table.concat(p, ",").."}"))
+    end
+
+    function Persist.get(k, d) local c = load(); return c[k] ~= nil and c[k] or d end
+    function Persist.set(k, v) local c = load(); c[k] = v; flush() end
+    function Persist.clear() cache = {}; pcall(delfile, FILE) end
+end
+
+--=============================================================
+-- [5] HWID · semi-stable device fingerprint
+--=============================================================
+local HWID = {}
+do
+    local function fp()
+        return Crypto.fnv1a(table.concat({
+            tostring(LP.UserId), tostring(LP.AccountAge or 0),
+            tostring(game.PlaceId or 0), math.floor(os.time()/86400).."", "HuyHub-v5"
+        }, "|"))
+    end
+    function HWID.get()
+        local c = Persist.get("hwid")
+        if c then return c end
+        local h = tostring(fp())
+        Persist.set("hwid", h)
+        return h
+    end
+end
+
+--=============================================================
+-- [6] RATE LIMIT · token bucket
+--=============================================================
+local RateLimit = {}
+RateLimit.__index = RateLimit
+function RateLimit.new(cap, rate)
+    return setmetatable({ cap = cap, tokens = cap, rate = rate, last = os.clock() }, RateLimit)
+end
+function RateLimit:try()
+    local now = os.clock()
+    self.tokens = math.min(self.cap, self.tokens + (now - self.last) * self.rate)
+    self.last = now
+    if self.tokens >= 1 then self.tokens = self.tokens - 1; return true end
+    return false
+end
+
+--=============================================================
+-- [7] NET · HTTP client with retry + circuit breaker
+--=============================================================
+local Net = {}
+Net.__index = Net
+function Net.new(cfg)
+    return setmetatable({
+        baseURL = cfg.baseURL, failures = 0, breakerUntil = 0,
+        threshold = cfg.threshold or 5, cooldown = cfg.cooldown or 15,
+    }, Net)
+end
+function Net:_req(method, path, body)
+    if os.clock() < self.breakerUntil then return false, "circuit_open" end
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if not req then return false, "no_http_lib" end
+    local ok, res = pcall(req, {
+        Url = self.baseURL..path, Method = method,
+        Headers = { ["Content-Type"]="application/json", ["X-Hub"]="HuyHub-v5" },
+        Body = body and Http:JSONEncode(body) or nil,
+    })
+    if not ok or not res or res.StatusCode >= 500 then
+        self.failures = self.failures + 1
+        if self.failures >= self.threshold then
+            self.breakerUntil = os.clock() + self.cooldown
+            self.failures = 0
+        end
+        return false, res and res.StatusCode or "network_error"
+    end
+    self.failures = 0
+    local dok, dec = pcall(Http.JSONDecode, res.Body)
+    return true, dok and dec or res.Body
+end
+function Net:post(p, b) return self:_req("POST", p, b) end
+function Net:get(p) return self:_req("GET", p) end
+
+--=============================================================
+-- [8] I18N
+--=============================================================
+local I18N = {}
+do
+    local dict = {
+        vi = {
+            title="HUY HUB", tagline="steal an egg 🥚",
+            verify="Xác minh Key", getkey="Lấy Key",
+            placeholder="Dán key tại đây...",
+            confirm="XÁC NHẬN KEY",
+            invalid="Key không hợp lệ!",
+            rate_limited="Thao tác quá nhanh, chờ chút...",
+            copied="Đã copy link GetKey",
+            loading="Đang tải Huy Hub...",
+            loading_fail="Không tải được script",
+            locked="Bị khóa · thử lại sau %ds",
+            network_err="Lỗi mạng, thử lại sau",
+            offline_mode="Chế độ offline (không xác minh server)",
+            empty_key="Vui lòng nhập key trước!",
+            success="Key hợp lệ! Đang tải...",
+        },
+        en = {
+            title="HUY HUB", tagline="steal an egg 🥚",
+            verify="Verify Key", getkey="Get Key",
+            placeholder="Paste key here...",
+            confirm="VERIFY KEY",
+            invalid="Invalid key!",
+            rate_limited="Too fast, slow down...",
+            copied="Link copied",
+            loading="Loading Huy Hub...",
+            loading_fail="Script download failed",
+            locked="Locked · retry in %ds",
+            network_err="Network error, try later",
+            offline_mode="Offline mode (no server verify)",
+            empty_key="Enter a key first!",
+            success="Key valid! Loading...",
+        },
+    }
+    local lang = Persist.get("lang", CONFIG.DEFAULT_LANG)
+    function I18N.t(k, ...) local s = (dict[lang] or dict.vi)[k] or k; return select("#", ...) > 0 and string.format(s, ...) or s end
+    function I18N.setLang(l) if dict[l] then lang = l; Persist.set("lang", l) end end
+    function I18N.getLang() return lang end
+end
+
+--=============================================================
+-- [9] STORE · Redux-like reactive
+--=============================================================
+local Store = {}
+Store.__index = Store
+function Store.new(init, reducer)
+    return setmetatable({
+        state = K.clone(init), reducer = reducer, listeners = {}, history = {}, historyLimit = 50,
+    }, Store)
+end
+function Store:dispatch(action)
+    local prev = self.state
+    local next = self.reducer(self.state, action) or self.state
+    if next ~= prev then
+        table.insert(self.history, { action = action, prev = prev })
+        if #self.history > self.historyLimit then table.remove(self.history, 1) end
+        self.state = next
+        for _, l in ipairs(self.listeners) do task.spawn(l, next, prev, action) end
+    end
+    return next
+end
+function Store:subscribe(fn)
+    table.insert(self.listeners, fn)
+    return function()
+        for i, l in ipairs(self.listeners) do
+            if l == fn then table.remove(self.listeners, i); break end
+        end
+    end
+end
+
+--=============================================================
+-- [10] MOTION · easings + spring
+--=============================================================
+local Motion = {}
+do
+    local T = {
+        pop  = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        out  = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        in_  = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
+        snap = TweenInfo.new(0.09, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+    }
+    function Motion.to(inst, props, preset)
+        local tw = Tween:Create(inst, T[preset or "out"], props); tw:Play(); return tw
+    end
+    function Motion.spring(inst, prop, target, opts)
+        opts = opts or {}
+        local k, damp = opts.stiffness or 180, opts.damping or 18
+        local v, x = 0, inst[prop]
+        local conn
+        conn = RS.RenderStepped:Connect(function(_, dt)
+            dt = math.min(dt, 1/30)
+            local a = -k * (x - target) - damp * v
+            v = v + a * dt; x = x + v * dt
+            inst[prop] = x
+            if math.abs(v) < 0.01 and math.abs(x - target) < 0.01 then
+                inst[prop] = target; conn:Disconnect()
+            end
+        end)
+    end
+end
+
+--=============================================================
+-- [11] AUTH · verify (server + local fallback)
+--=============================================================
+local Auth = {}
+Auth.__index = Auth
+
+local EXPECTED_HASH = Crypto.fnv1a(CONFIG.CORRECT_KEY .. CONFIG.SALT)
+local function verifyLocal(key)
+    return Crypto.ctEq(Crypto.fnv1a((key or "") .. CONFIG.SALT), EXPECTED_HASH)
+end
+
+function Auth.new()
+    local net = #CONFIG.AUTH_ENDPOINT > 0 and Net.new({ baseURL = CONFIG.AUTH_ENDPOINT }) or nil
+    return setmetatable({
+        rl = RateLimit.new(3, 0.5),
+        attempts = Persist.get("attempts", 0),
+        lockUntil = Persist.get("lockUntil", 0),
+        net = net,
+    }, Auth)
+end
+
+function Auth:isLocked() return os.time() < self.lockUntil end
+function Auth:_duration()
+    local a = self.attempts
+    return a >= 10 and 900 or a >= 6 and 300 or a >= 4 and 120 or a >= 3 and 60 or 30
+end
+function Auth:_fail()
+    self.attempts = self.attempts + 1
+    Persist.set("attempts", self.attempts)
+    if self.attempts >= 3 then
+        self.lockUntil = os.time() + self:_duration()
+        Persist.set("lockUntil", self.lockUntil)
+    end
+end
+function Auth:_reset()
+    self.attempts = 0; self.lockUntil = 0
+    Persist.set("attempts", 0); Persist.set("lockUntil", 0)
+end
+
+function Auth:verify(key, cb)
+    if self:isLocked() then
+        return cb(false, "locked", { seconds = self.lockUntil - os.time() })
+    end
+    if not self.rl:try() then
+        return cb(false, "rate_limited", nil)
+    end
+
+    if self.net then
+        task.spawn(function()
+            local ok, res = K.retry(function()
+                return self.net:post(CONFIG.AUTH_PATH, {
+                    key = key, hwid = HWID.get(), userId = LP.UserId, v = "5.0",
+                })
+            end, 2, 0.5)()
+            if ok and res and res.valid then
+                self:_reset()
+                Persist.set("token", res.token or "")
+                Persist.set("tier", res.tier or "free")
+                Persist.set("expire", res.expire or 0)
+                cb(true, res.token, res)
+            elseif ok and res then
+                self:_fail(); cb(false, res.reason or "invalid", res)
+            else
+                if verifyLocal(key) then self:_reset(); cb(true, "offline", { offline = true })
+                else self:_fail(); cb(false, "network_fail", nil) end
+            end
+        end)
+    else
+        task.spawn(function()
+            task.wait(0.35)
+            if verifyLocal(key) then self:_reset(); cb(true, "offline", { offline = true })
+            else self:_fail(); cb(false, "invalid", nil) end
+        end)
+    end
+end
+
+--=============================================================
+-- [12] THEME
+--=============================================================
+local THEME = {
+    bg        = Color3.fromRGB(10, 10, 15),
+    surface   = Color3.fromRGB(22, 22, 32),
+    surfaceHi = Color3.fromRGB(34, 34, 48),
+    stroke    = Color3.fromRGB(50, 50, 68),
+    text      = Color3.fromRGB(240, 240, 250),
+    textSec   = Color3.fromRGB(160, 160, 185),
+    textMut   = Color3.fromRGB(108, 108, 132),
+    accent    = Color3.fromRGB(124, 108, 255),
+    accentHi  = Color3.fromRGB(158, 140, 255),
+    success   = Color3.fromRGB(0, 220, 140),
+    danger    = Color3.fromRGB(255, 88, 88),
+    warn      = Color3.fromRGB(255, 190, 60),
+    info      = Color3.fromRGB(0, 190, 255),
+    r = { sm = 6, md = 10, lg = 14, full = 999 },
+}
+
+--=============================================================
+-- [13] APP · UI + logic (giữ nguyên hành vi gốc)
+--=============================================================
+local INITIAL_STATE = {
+    tab = 1, key = "", status = "idle", lockedUntil = 0,
+    toast = {}, lang = I18N.getLang(), loading = false, loadingMsg = "",
+}
+
+local function reducer(state, action)
+    local t = action.type
+    if t == "TAB_SET"    then return K.merge(state, { tab = action.payload })
+    elseif t == "KEY_SET" then return K.merge(state, { key = action.payload })
+    elseif t == "STATUS_SET" then return K.merge(state, { status = action.payload })
+    elseif t == "LOCK_SET" then return K.merge(state, { lockedUntil = action.payload })
+    elseif t == "TOAST_PUSH" then
+        local n = K.clone(state.toast); n[#n+1] = action.payload
+        return K.merge(state, { toast = n })
+    elseif t == "TOAST_DROP" then
+        local n = {}
+        for _, x in ipairs(state.toast) do if x.id ~= action.payload then n[#n+1] = x end end
+        return K.merge(state, { toast = n })
+    elseif t == "LOADING_SET" then return K.merge(state, { loading = action.payload.on, loadingMsg = action.payload.msg or "" })
+    elseif t == "LANG_SET" then I18N.setLang(action.payload); return K.merge(state, { lang = action.payload })
+    end
+    return state
+end
+
+local App = {}
+App.__index = App
+
+function App.new()
+    local self = setmetatable({
+        _conns = {}, _plugins = {},
+        store = Store.new(INITIAL_STATE, reducer),
+        auth = Auth.new(),
+        toastSeq = 0,
+    }, App)
+
+    local old = CoreGui:FindFirstChild(CONFIG.UI_NAME)
+    if old then old:Destroy() end
+
+    local root = Instance.new("ScreenGui")
+    root.Name = CONFIG.UI_NAME
+    root.ResetOnSpawn = false
+    root.IgnoreGuiInset = true
+    root.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    root.Parent = CoreGui
+    self.root = root
+
+    self:_buildUI()
+    self:_wireStore()
+    self:_runIntro()
+    self:_verifyCachedSession()
+    return self
+end
+
+--──────────────────────────────────────────────
+-- UI BUILD
+--──────────────────────────────────────────────
+function App:_buildUI()
+    local function corner(p, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or THEME.r.md); c.Parent = p; return c end
+    local function stroke(p, col, th) local s = Instance.new("UIStroke"); s.Color = col or THEME.stroke; s.Thickness = th or 1; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Parent = p; return s end
+    local function shadow(p, sz, tr)
+        local s = Instance.new("ImageLabel")
+        s.Name = "__shadow"; s.BackgroundTransparency = 1
+        s.Image = "rbxassetid://5028857084"; s.ImageColor3 = Color3.new(0,0,0)
+        s.ImageTransparency = tr or 0.55; s.ScaleType = Enum.ScaleType.Slice
+        s.SliceCenter = Rect.new(24,24,276,276)
+        s.Size = UDim2.new(1, sz, 1, sz); 
